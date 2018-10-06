@@ -25,24 +25,25 @@ import (
 	"github.com/go-macaron/session"
 	"github.com/go-macaron/toolbox"
 	"github.com/mcuadros/go-version"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli"
 	log "gopkg.in/clog.v1"
 	"gopkg.in/macaron.v1"
 
-	"github.com/gogits/gogs/models"
-	"github.com/gogits/gogs/pkg/bindata"
-	"github.com/gogits/gogs/pkg/context"
-	"github.com/gogits/gogs/pkg/form"
-	"github.com/gogits/gogs/pkg/mailer"
-	"github.com/gogits/gogs/pkg/setting"
-	"github.com/gogits/gogs/pkg/template"
-	"github.com/gogits/gogs/routes"
-	"github.com/gogits/gogs/routes/admin"
-	apiv1 "github.com/gogits/gogs/routes/api/v1"
-	"github.com/gogits/gogs/routes/dev"
-	"github.com/gogits/gogs/routes/org"
-	"github.com/gogits/gogs/routes/repo"
-	"github.com/gogits/gogs/routes/user"
+	"github.com/gogs/gogs/models"
+	"github.com/gogs/gogs/pkg/bindata"
+	"github.com/gogs/gogs/pkg/context"
+	"github.com/gogs/gogs/pkg/form"
+	"github.com/gogs/gogs/pkg/mailer"
+	"github.com/gogs/gogs/pkg/setting"
+	"github.com/gogs/gogs/pkg/template"
+	"github.com/gogs/gogs/routes"
+	"github.com/gogs/gogs/routes/admin"
+	apiv1 "github.com/gogs/gogs/routes/api/v1"
+	"github.com/gogs/gogs/routes/dev"
+	"github.com/gogs/gogs/routes/org"
+	"github.com/gogs/gogs/routes/repo"
+	"github.com/gogs/gogs/routes/user"
 )
 
 var Web = cli.Command{
@@ -64,7 +65,7 @@ func checkVersion() {
 	if err != nil {
 		log.Fatal(2, "Fail to read 'templates/.VERSION': %v", err)
 	}
-	tplVer := string(data)
+	tplVer := strings.TrimSpace(string(data))
 	if tplVer != setting.AppVer {
 		if version.Compare(tplVer, setting.AppVer, ">") {
 			log.Fatal(2, "Binary version is lower than template file version, did you forget to recompile Gogs?")
@@ -96,7 +97,14 @@ func newMacaron() *macaron.Macaron {
 	m.Use(macaron.Static(
 		setting.AvatarUploadPath,
 		macaron.StaticOptions{
-			Prefix:      "avatars",
+			Prefix:      models.USER_AVATAR_URL_PREFIX,
+			SkipLogging: setting.DisableRouterLog,
+		},
+	))
+	m.Use(macaron.Static(
+		setting.RepositoryAvatarUploadPath,
+		macaron.StaticOptions{
+			Prefix:      models.REPO_AVATAR_URL_PREFIX,
 			SkipLogging: setting.DisableRouterLog,
 		},
 	))
@@ -171,6 +179,8 @@ func runWeb(c *cli.Context) error {
 	reqSignOut := context.Toggle(&context.ToggleOptions{SignOutRequired: true})
 
 	bindIgnErr := binding.BindIgnErr
+
+	m.SetAutoHead(true)
 
 	// FIXME: not all routes need go through same middlewares.
 	// Especially some AJAX requests, we can reduce middleware number to improve performance.
@@ -251,11 +261,11 @@ func runWeb(c *cli.Context) error {
 	})
 	// ***** END: User *****
 
-	adminReq := context.Toggle(&context.ToggleOptions{SignInRequired: true, AdminRequired: true})
+	reqAdmin := context.Toggle(&context.ToggleOptions{SignInRequired: true, AdminRequired: true})
 
 	// ***** START: Admin *****
 	m.Group("/admin", func() {
-		m.Get("", adminReq, admin.Dashboard)
+		m.Get("", admin.Dashboard)
 		m.Get("/config", admin.Config)
 		m.Post("/config/test_mail", admin.SendTestMail)
 		m.Get("/monitor", admin.Monitor)
@@ -289,7 +299,7 @@ func runWeb(c *cli.Context) error {
 			m.Post("/delete", admin.DeleteNotices)
 			m.Get("/empty", admin.EmptyNotices)
 		})
-	}, adminReq)
+	}, reqAdmin)
 	// ***** END: Admin *****
 
 	m.Group("", func() {
@@ -417,6 +427,9 @@ func runWeb(c *cli.Context) error {
 		m.Group("/settings", func() {
 			m.Combo("").Get(repo.Settings).
 				Post(bindIgnErr(form.RepoSetting{}), repo.SettingsPost)
+			m.Combo("/avatar").Get(repo.SettingsAvatar).
+				Post(binding.MultipartForm(form.Avatar{}), repo.SettingsAvatarPost)
+			m.Post("/avatar/delete", repo.SettingsDeleteAvatar)
 			m.Group("/collaboration", func() {
 				m.Combo("").Get(repo.SettingsCollaboration).Post(repo.SettingsCollaborationPost)
 				m.Post("/access_mode", repo.ChangeCollaborationAccessMode)
@@ -635,8 +648,10 @@ func runWeb(c *cli.Context) error {
 		// e.g. with or without ".git" suffix.
 		m.Group("/:reponame([\\d\\w-_\\.]+\\.git$)", func() {
 			m.Get("", ignSignIn, context.RepoAssignment(), context.RepoRef(), repo.Home)
+			m.Options("/*", ignSignInAndCsrf, repo.HTTPContexter(), repo.HTTP)
 			m.Route("/*", "GET,POST", ignSignInAndCsrf, repo.HTTPContexter(), repo.HTTP)
 		})
+		m.Options("/:reponame/*", ignSignInAndCsrf, repo.HTTPContexter(), repo.HTTP)
 		m.Route("/:reponame/*", "GET,POST", ignSignInAndCsrf, repo.HTTPContexter(), repo.HTTP)
 	})
 	// ***** END: Repository *****
@@ -644,6 +659,18 @@ func runWeb(c *cli.Context) error {
 	m.Group("/api", func() {
 		apiv1.RegisterRoutes(m)
 	}, ignSignIn)
+
+	m.Group("/-", func() {
+		if setting.Prometheus.Enabled {
+			m.Get("/metrics", func(c *context.Context) {
+				if !setting.Prometheus.EnableBasicAuth {
+					return
+				}
+
+				c.RequireBasicAuth(setting.Prometheus.BasicAuthUsername, setting.Prometheus.BasicAuthPassword)
+			}, promhttp.Handler())
+		}
+	})
 
 	// robots.txt
 	m.Get("/robots.txt", func(c *context.Context) {
@@ -723,7 +750,7 @@ func runWeb(c *cli.Context) error {
 	}
 
 	if err != nil {
-		log.Fatal(4, "Fail to start server: %v", err)
+		log.Fatal(4, "Failed to start server: %v", err)
 	}
 
 	return nil

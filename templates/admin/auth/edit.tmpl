@@ -186,10 +186,17 @@
 								<input name="is_active" type="checkbox" {{if .Source.IsActived}}checked{{end}}>
 							</div>
 						</div>
-
+						<div class="inline field">
+							<div class="ui checkbox">
+								<label><strong>{{.i18n.Tr "admin.auths.default_auth"}}</strong></label>
+								<input name="is_default" type="checkbox" {{if .Source.IsDefault}}checked{{end}}>
+							</div>
+						</div>
 						<div class="field">
 							<button class="ui green button">{{.i18n.Tr "admin.auths.update"}}</button>
-							<div class="ui red button delete-button" data-url="{{$.Link}}/delete" data-id="{{.Source.ID}}">{{.i18n.Tr "admin.auths.delete"}}</div>
+							{{if not .Source.LocalFile}}
+								<div class="ui red button delete-button" data-url="{{$.Link}}/delete" data-id="{{.Source.ID}}">{{.i18n.Tr "admin.auths.delete"}}</div>
+							{{end}}
 						</div>
 					</form>
 				</div>
